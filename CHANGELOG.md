@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added response size limits, as pub fields: `max_headers_len` and `max_body_len` on `Http11Send` and `Http10Send`, `max_len` on `Http11HeadersRead`, `max_body_len` on `Http11ChunksRead` and `max_chunk_len` on `Http11ChunksReadStream`. Heads default to `HTTP_DEFAULT_MAX_HEADERS_LEN` (64 KiB), bodies and chunks to `HTTP_DEFAULT_MAX_BODY_LEN` (256 MiB), and chunk size lines are capped at `HTTP11_MAX_CHUNK_LINE_LEN` (4 KiB).
+
+- Added a `response` cargo-fuzz target under fuzz/, run from the new `fuzz` devShell.
+
+### Changed
+
+- Added `TooLarge`, `HeadersTooLarge`, `BodyTooLarge`, `ChunkLineTooLarge`, `ChunkTooLarge` and `Eof` variants to the read and send error enums. **Breaking.**
+
+### Fixed
+
+- Fixed a panic on a chunk size near `usize::MAX`, such as `FFFFFFFFFFFFFFFF`, which overflowed the size arithmetic: a hostile server could crash the client.
+
+- Fixed unbounded buffering of the response head, of `Content-Length`, chunked and read-to-EOF bodies, and of chunk size lines: a server exceeding a limit now fails the exchange with a typed error.
+
+- Fixed the send and chunk coroutines spinning on `WantsRead` forever when the connection closed before a `Content-Length` or chunked body was complete. They now fail with `Eof`.
+
+- Fixed `Content-Length` and chunk sizes accepting a leading `+`.
+
 ## [0.5.0] - 2026-08-15
 
 ### Changed

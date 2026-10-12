@@ -15,7 +15,11 @@ use log::{debug, trace};
 use memchr::{memchr, memmem};
 use thiserror::Error;
 
-use crate::{coroutine::*, rfc9110::chars::CRLF};
+use crate::{
+    coroutine::*,
+    rfc9110::{chars::CRLF, send::HTTP_DEFAULT_MAX_BODY_LEN},
+    rfc9112::chunk::HTTP11_MAX_CHUNK_LINE_LEN,
+};
 
 /// Failure causes during the HTTP/1.1 chunked-body streaming flow.
 #[derive(Debug, Error)]
@@ -23,6 +27,15 @@ pub enum Http11ChunksReadStreamError {
     /// The chunk size line is not a valid hexadecimal integer.
     #[error("HTTP/1.1 read chunks failed: invalid chunk size `{0}`")]
     InvalidChunkSize(String),
+    /// The stream reached EOF before the zero-length terminator.
+    #[error("HTTP/1.1 read chunks failed: reached unexpected EOF")]
+    Eof,
+    /// The chunk size line exceeds [`HTTP11_MAX_CHUNK_LINE_LEN`].
+    #[error("HTTP/1.1 read chunks failed: chunk size line exceeds {0} bytes")]
+    ChunkLineTooLarge(usize),
+    /// A chunk exceeds [`Http11ChunksReadStream::max_chunk_len`].
+    #[error("HTTP/1.1 read chunks failed: chunk exceeds {0} bytes")]
+    ChunkTooLarge(usize),
 }
 
 /// Per-step yield emitted by [`Http11ChunksReadStream`]; adds
@@ -48,12 +61,29 @@ enum State {
 
 /// I/O-free streaming chunked-body decoder. `Complete(Ok(remaining))`
 /// carries bytes already buffered past the zero-length terminator.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Http11ChunksReadStream {
+    /// Maximum size in bytes of a single chunk. A chunk announcing more
+    /// fails the read with [`Http11ChunksReadStreamError::ChunkTooLarge`]
+    /// before any of it is buffered. The stream itself is unbounded.
+    /// Defaults to [`HTTP_DEFAULT_MAX_BODY_LEN`].
+    pub max_chunk_len: usize,
     state: State,
     wants_read: bool,
     done: bool,
     buf: Vec<u8>,
+}
+
+impl Default for Http11ChunksReadStream {
+    fn default() -> Self {
+        Self {
+            max_chunk_len: HTTP_DEFAULT_MAX_BODY_LEN,
+            state: State::default(),
+            wants_read: false,
+            done: false,
+            buf: Vec::new(),
+        }
+    }
 }
 
 impl HttpCoroutine for Http11ChunksReadStream {
@@ -61,8 +91,12 @@ impl HttpCoroutine for Http11ChunksReadStream {
     type Return = Result<Vec<u8>, Http11ChunksReadStreamError>;
 
     fn resume(&mut self, arg: Option<&[u8]>) -> HttpCoroutineState<Self::Yield, Self::Return> {
-        if let Some(data) = arg {
-            self.buf.extend_from_slice(data);
+        match arg {
+            Some(&[]) => {
+                return HttpCoroutineState::Complete(Err(Http11ChunksReadStreamError::Eof));
+            }
+            Some(data) => self.buf.extend_from_slice(data),
+            None => {}
         }
 
         loop {
@@ -78,7 +112,15 @@ impl HttpCoroutine for Http11ChunksReadStream {
 
             match self.state {
                 State::ChunkSize => {
-                    let Some(crlf) = memmem::find(&self.buf, &CRLF) else {
+                    let line_window = self.buf.len().min(HTTP11_MAX_CHUNK_LINE_LEN + CRLF.len());
+
+                    let Some(crlf) = memmem::find(&self.buf[..line_window], &CRLF) else {
+                        if line_window == HTTP11_MAX_CHUNK_LINE_LEN + CRLF.len() {
+                            let limit = HTTP11_MAX_CHUNK_LINE_LEN;
+                            let err = Http11ChunksReadStreamError::ChunkLineTooLarge(limit);
+                            return HttpCoroutineState::Complete(Err(err));
+                        }
+
                         self.wants_read = true;
                         continue;
                     };
@@ -94,11 +136,23 @@ impl HttpCoroutine for Http11ChunksReadStream {
 
                     let chunk_size = String::from_utf8_lossy(self.buf[..ext].trim_ascii());
 
-                    let Ok(n) = usize::from_str_radix(&chunk_size, 16) else {
+                    let is_hex = chunk_size.bytes().all(|b| b.is_ascii_hexdigit());
+
+                    let Some(n) = is_hex
+                        .then(|| usize::from_str_radix(&chunk_size, 16).ok())
+                        .flatten()
+                    else {
                         let chunk_size = chunk_size.to_string();
                         let err = Http11ChunksReadStreamError::InvalidChunkSize(chunk_size);
                         return HttpCoroutineState::Complete(Err(err));
                     };
+
+                    // NOTE: the checked addition keeps `n + CRLF`
+                    // addressable even when the limit is `usize::MAX`.
+                    if n > self.max_chunk_len || n.checked_add(CRLF.len()).is_none() {
+                        let err = Http11ChunksReadStreamError::ChunkTooLarge(self.max_chunk_len);
+                        return HttpCoroutineState::Complete(Err(err));
+                    }
 
                     self.buf.drain(..crlf + CRLF.len());
                     debug!("reading chunk of {n} bytes");
@@ -161,8 +215,37 @@ mod tests {
     fn invalid_chunk_size() {
         let mut coroutine = Http11ChunksReadStream::default();
         let err = expect_complete_err(&mut coroutine, Some(b":\r\n0\r\n\r\n"));
-        let Http11ChunksReadStreamError::InvalidChunkSize(s) = err;
+        let Http11ChunksReadStreamError::InvalidChunkSize(s) = err else {
+            panic!("expected InvalidChunkSize, got {err:?}");
+        };
         assert_eq!(s, ":");
+    }
+
+    #[test]
+    fn max_usize_chunk_size_errors() {
+        let mut coroutine = Http11ChunksReadStream::default();
+        coroutine.max_chunk_len = usize::MAX;
+        let err = expect_complete_err(&mut coroutine, Some(b"FFFFFFFFFFFFFFFF\r\n"));
+        assert!(matches!(err, Http11ChunksReadStreamError::ChunkTooLarge(_)));
+    }
+
+    #[test]
+    fn chunk_over_limit_errors() {
+        let mut coroutine = Http11ChunksReadStream::default();
+        coroutine.max_chunk_len = 4;
+        let err = expect_complete_err(&mut coroutine, Some(b"5\r\nhello\r\n"));
+        assert!(matches!(err, Http11ChunksReadStreamError::ChunkTooLarge(4)));
+    }
+
+    #[test]
+    fn chunk_line_over_limit_errors() {
+        let mut coroutine = Http11ChunksReadStream::default();
+        let line = [b'0'; HTTP11_MAX_CHUNK_LINE_LEN + 2];
+        let err = expect_complete_err(&mut coroutine, Some(&line));
+        assert!(matches!(
+            err,
+            Http11ChunksReadStreamError::ChunkLineTooLarge(_)
+        ));
     }
 
     #[test]

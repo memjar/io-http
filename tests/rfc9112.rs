@@ -7,7 +7,7 @@ use io_http::{
     coroutine::*,
     rfc9110::{request::HttpRequest, send::*},
     rfc9112::{
-        chunk::Http11ChunksRead,
+        chunk::{Http11ChunksRead, Http11ChunksReadError},
         send::{Http11Send, Http11SendError},
     },
 };
@@ -331,4 +331,133 @@ fn chunks_extension_ignored() {
 fn chunks_size_hex() {
     // NOTE: 0x0a = 10 bytes
     assert_eq!(test_chunks(b"a\r\n0123456789\r\n0\r\n\r\n"), b"0123456789");
+}
+
+/// Drives `send` against `response` once, then reports EOF.
+fn test_once(mut send: Http11Send, response: &[u8]) -> Step {
+    let mut arg: Option<&[u8]> = None;
+    let mut sent = false;
+
+    loop {
+        match send.resume(arg.take()) {
+            HttpCoroutineState::Yielded(HttpSendYield::WantsWrite(_)) => arg = None,
+            HttpCoroutineState::Yielded(HttpSendYield::WantsRead) if !sent => {
+                sent = true;
+                arg = Some(response);
+            }
+            HttpCoroutineState::Yielded(HttpSendYield::WantsRead) => arg = Some(b""),
+            any => return any,
+        }
+    }
+}
+
+fn new_send() -> Http11Send {
+    let url = Url::parse("http://example.com/").unwrap();
+    Http11Send::new(HttpRequest::get(url).header("Host", "example.com"))
+}
+
+#[test]
+fn err_on_max_usize_chunk_size() {
+    let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\n";
+
+    match test_once(new_send(), response) {
+        HttpCoroutineState::Complete(Err(Http11SendError::ReadChunks(
+            Http11ChunksReadError::BodyTooLarge(_),
+        ))) => {}
+        other => panic!("expected BodyTooLarge, got: {other:?}"),
+    }
+
+    // NOTE: even an unbounded limit must not overflow `size + CRLF`.
+    let mut send = new_send();
+    send.max_body_len = usize::MAX;
+
+    match test_once(send, response) {
+        HttpCoroutineState::Complete(Err(Http11SendError::ReadChunks(
+            Http11ChunksReadError::BodyTooLarge(_),
+        ))) => {}
+        other => panic!("expected BodyTooLarge, got: {other:?}"),
+    }
+}
+
+#[test]
+fn err_on_chunked_body_over_limit() {
+    let response =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    let mut send = new_send();
+    send.max_body_len = 8;
+
+    match test_once(send, response) {
+        HttpCoroutineState::Complete(Err(Http11SendError::ReadChunks(
+            Http11ChunksReadError::BodyTooLarge(8),
+        ))) => {}
+        other => panic!("expected BodyTooLarge, got: {other:?}"),
+    }
+}
+
+#[test]
+fn err_on_headers_over_limit() {
+    let response = b"HTTP/1.1 200 OK\r\nX-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+    let mut send = new_send();
+    send.max_headers_len = 64;
+
+    match test_once(send, response) {
+        HttpCoroutineState::Complete(Err(Http11SendError::HeadersTooLarge(64))) => {}
+        other => panic!("expected HeadersTooLarge, got: {other:?}"),
+    }
+}
+
+#[test]
+fn err_on_content_length_over_limit() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world";
+    let mut send = new_send();
+    send.max_body_len = 5;
+
+    match test_once(send, response) {
+        HttpCoroutineState::Complete(Err(Http11SendError::BodyTooLarge(5))) => {}
+        other => panic!("expected BodyTooLarge, got: {other:?}"),
+    }
+}
+
+#[test]
+fn err_on_content_length_overflow() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999999\r\n\r\n";
+
+    match test_once(new_send(), response) {
+        HttpCoroutineState::Complete(Err(Http11SendError::InvalidContentLength(_))) => {}
+        other => panic!("expected InvalidContentLength, got: {other:?}"),
+    }
+}
+
+#[test]
+fn err_on_read_to_eof_body_over_limit() {
+    let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello world";
+    let mut send = new_send();
+    send.max_body_len = 5;
+
+    match test_once(send, response) {
+        HttpCoroutineState::Complete(Err(Http11SendError::BodyTooLarge(5))) => {}
+        other => panic!("expected BodyTooLarge, got: {other:?}"),
+    }
+}
+
+#[test]
+fn err_on_eof_before_content_length() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello";
+
+    match test_once(new_send(), response) {
+        HttpCoroutineState::Complete(Err(Http11SendError::Eof)) => {}
+        other => panic!("expected Eof, got: {other:?}"),
+    }
+}
+
+#[test]
+fn err_on_eof_before_last_chunk() {
+    let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
+
+    match test_once(new_send(), response) {
+        HttpCoroutineState::Complete(Err(Http11SendError::ReadChunks(
+            Http11ChunksReadError::Eof,
+        ))) => {}
+        other => panic!("expected Eof, got: {other:?}"),
+    }
 }

@@ -30,6 +30,9 @@ pub enum Http11HeadersReadError {
     /// The response head could not be parsed.
     #[error("HTTP/1.X read headers failed: parse response headers: {0}")]
     ParseResponseHeaders(HttparseError),
+    /// The response head exceeds [`Http11HeadersRead::max_len`].
+    #[error("HTTP/1.X read headers failed: response head exceeds {0} bytes")]
+    TooLarge(usize),
 }
 
 /// Terminal output of [`Http11HeadersRead`]; the response body is
@@ -44,10 +47,27 @@ pub struct Http11HeadersReadOutput {
     pub keep_alive: bool,
 }
 
+/// Default value of [`Http11HeadersRead::max_len`]: 64 KiB.
+pub const HTTP_DEFAULT_MAX_HEADERS_LEN: usize = 64 * 1024;
+
 /// I/O-free coroutine to read and parse an HTTP/1.X response head.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Http11HeadersRead {
+    /// Maximum size in bytes of the response head, status line and
+    /// terminating empty line included. A peer exceeding it fails the
+    /// read with [`Http11HeadersReadError::TooLarge`] instead of growing
+    /// the buffer without bound.
+    pub max_len: usize,
     buf: Vec<u8>,
+}
+
+impl Default for Http11HeadersRead {
+    fn default() -> Self {
+        Self {
+            max_len: HTTP_DEFAULT_MAX_HEADERS_LEN,
+            buf: Vec::new(),
+        }
+    }
 }
 
 impl HttpCoroutine for Http11HeadersRead {
@@ -67,7 +87,15 @@ impl HttpCoroutine for Http11HeadersRead {
         let mut parsed = Response::new(&mut headers);
 
         let header_end = match parsed.parse(&self.buf) {
+            Ok(Status::Complete(n)) if n > self.max_len => {
+                let err = Http11HeadersReadError::TooLarge(self.max_len);
+                return HttpCoroutineState::Complete(Err(err));
+            }
             Ok(Status::Complete(n)) => n,
+            Ok(Status::Partial) if self.buf.len() > self.max_len => {
+                let err = Http11HeadersReadError::TooLarge(self.max_len);
+                return HttpCoroutineState::Complete(Err(err));
+            }
             Ok(Status::Partial) => {
                 trace!("received incomplete headers");
                 return HttpCoroutineState::Yielded(HttpYield::WantsRead);
@@ -160,6 +188,23 @@ mod tests {
         let reply = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
         let out = expect_complete_ok(&mut coroutine, Some(reply));
         assert!(!out.keep_alive);
+    }
+
+    #[test]
+    fn partial_head_over_limit_errors() {
+        let mut coroutine = Http11HeadersRead::default();
+        coroutine.max_len = 32;
+        expect_wants_read(&mut coroutine, Some(b"HTTP/1.1 200 OK\r\n"));
+        let err = expect_complete_err(&mut coroutine, Some(b"X-Filler: aaaaaaaaaaaaaaaa\r\n"));
+        assert!(matches!(err, Http11HeadersReadError::TooLarge(32)));
+    }
+
+    #[test]
+    fn complete_head_over_limit_errors() {
+        let mut coroutine = Http11HeadersRead::default();
+        coroutine.max_len = 16;
+        let err = expect_complete_err(&mut coroutine, Some(b"HTTP/1.1 200 OK\r\n\r\n"));
+        assert!(matches!(err, Http11HeadersReadError::TooLarge(16)));
     }
 
     fn expect_wants_read(cor: &mut Http11HeadersRead, arg: Option<&[u8]>) {

@@ -180,3 +180,72 @@ fn err_on_malformed_headers() {
         other => panic!("expected Err, got: {other:?}"),
     }
 }
+
+/// Drives `send` against `response` once, then reports EOF.
+fn test_once(mut send: Http10Send, response: &[u8]) -> Step {
+    let mut arg: Option<&[u8]> = None;
+    let mut sent = false;
+
+    loop {
+        match send.resume(arg.take()) {
+            HttpCoroutineState::Yielded(HttpSendYield::WantsWrite(_)) => arg = None,
+            HttpCoroutineState::Yielded(HttpSendYield::WantsRead) if !sent => {
+                sent = true;
+                arg = Some(response);
+            }
+            HttpCoroutineState::Yielded(HttpSendYield::WantsRead) => arg = Some(b""),
+            any => return any,
+        }
+    }
+}
+
+fn new_send() -> Http10Send {
+    let url = Url::parse("http://example.com/").unwrap();
+    Http10Send::new(HttpRequest::get(url).header("Host", "example.com"))
+}
+
+#[test]
+fn err_on_headers_over_limit() {
+    let response = b"HTTP/1.0 200 OK\r\nX-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+    let mut send = new_send();
+    send.max_headers_len = 64;
+
+    match test_once(send, response) {
+        HttpCoroutineState::Complete(Err(Http10SendError::HeadersTooLarge(64))) => {}
+        other => panic!("expected HeadersTooLarge, got: {other:?}"),
+    }
+}
+
+#[test]
+fn err_on_content_length_over_limit() {
+    let response = b"HTTP/1.0 200 OK\r\nContent-Length: 11\r\n\r\nhello world";
+    let mut send = new_send();
+    send.max_body_len = 5;
+
+    match test_once(send, response) {
+        HttpCoroutineState::Complete(Err(Http10SendError::BodyTooLarge(5))) => {}
+        other => panic!("expected BodyTooLarge, got: {other:?}"),
+    }
+}
+
+#[test]
+fn err_on_read_to_eof_body_over_limit() {
+    let response = b"HTTP/1.0 200 OK\r\n\r\nhello world";
+    let mut send = new_send();
+    send.max_body_len = 5;
+
+    match test_once(send, response) {
+        HttpCoroutineState::Complete(Err(Http10SendError::BodyTooLarge(5))) => {}
+        other => panic!("expected BodyTooLarge, got: {other:?}"),
+    }
+}
+
+#[test]
+fn err_on_eof_before_content_length() {
+    let response = b"HTTP/1.0 200 OK\r\nContent-Length: 11\r\n\r\nhello";
+
+    match test_once(new_send(), response) {
+        HttpCoroutineState::Complete(Err(Http10SendError::Eof)) => {}
+        other => panic!("expected Eof, got: {other:?}"),
+    }
+}

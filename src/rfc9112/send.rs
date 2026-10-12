@@ -73,11 +73,11 @@ use crate::{
         headers::{HTTP_CONTENT_LENGTH, HTTP_LOCATION, HTTP_TRANSFER_ENCODING},
         request::HttpRequest,
         response::HttpResponse,
-        send::{HttpSendOutput, HttpSendYield},
+        send::{HTTP_DEFAULT_MAX_BODY_LEN, HttpSendOutput, HttpSendYield},
     },
     rfc9112::{
         chunk::{Http11ChunksRead, Http11ChunksReadError},
-        read_headers::{Http11HeadersRead, Http11HeadersReadError},
+        read_headers::{HTTP_DEFAULT_MAX_HEADERS_LEN, Http11HeadersRead, Http11HeadersReadError},
     },
 };
 
@@ -96,6 +96,12 @@ pub enum Http11SendError {
     /// The chunked-body decoder failed.
     #[error("HTTP/1.1 send failed: {0}")]
     ReadChunks(#[from] Http11ChunksReadError),
+    /// The response head exceeds [`Http11Send::max_headers_len`].
+    #[error("HTTP/1.1 send failed: response head exceeds {0} bytes")]
+    HeadersTooLarge(usize),
+    /// The response body exceeds [`Http11Send::max_body_len`].
+    #[error("HTTP/1.1 send failed: response body exceeds {0} bytes")]
+    BodyTooLarge(usize),
 }
 
 impl From<Http11HeadersReadError> for Http11SendError {
@@ -103,6 +109,7 @@ impl From<Http11HeadersReadError> for Http11SendError {
         match err {
             Http11HeadersReadError::Eof => Self::Eof,
             Http11HeadersReadError::ParseResponseHeaders(e) => Self::ParseResponseHeaders(e),
+            Http11HeadersReadError::TooLarge(limit) => Self::HeadersTooLarge(limit),
         }
     }
 }
@@ -118,6 +125,13 @@ enum State {
 /// I/O-free coroutine to send an HTTP/1.1 request and receive its response.
 #[derive(Debug)]
 pub struct Http11Send {
+    /// Maximum size in bytes of the response head. Defaults to
+    /// [`HTTP_DEFAULT_MAX_HEADERS_LEN`].
+    pub max_headers_len: usize,
+    /// Maximum size in bytes of the response body, whatever its
+    /// framing (fixed-length, chunked or read-to-EOF). Defaults to
+    /// [`HTTP_DEFAULT_MAX_BODY_LEN`].
+    pub max_body_len: usize,
     request_url: Url,
     state: State,
     wants_write: Option<Vec<u8>>,
@@ -137,6 +151,8 @@ impl Http11Send {
         let bytes = req.to_http_11_vec();
 
         Self {
+            max_headers_len: HTTP_DEFAULT_MAX_HEADERS_LEN,
+            max_body_len: HTTP_DEFAULT_MAX_BODY_LEN,
             request_url,
             state: State::ReadHeaders(Http11HeadersRead::default()),
             wants_write: Some(bytes),
@@ -189,6 +205,10 @@ impl HttpCoroutine for Http11Send {
                 return HttpCoroutineState::Yielded(HttpSendYield::WantsWrite(bytes));
             }
 
+            if let State::ReadHeaders(rh) = &mut self.state {
+                rh.max_len = self.max_headers_len;
+            }
+
             match &mut self.state {
                 State::ReadHeaders(rh) => match rh.resume(arg.take()) {
                     HttpCoroutineState::Yielded(HttpYield::WantsRead) => {
@@ -216,7 +236,14 @@ impl HttpCoroutine for Http11Send {
                                 .is_some_and(|enc| enc.eq_ignore_ascii_case("chunked"));
                             if chunked {
                                 let mut chunks = Http11ChunksRead::default();
-                                match chunks.resume(Some(&out.remaining)) {
+                                chunks.max_body_len = self.max_body_len;
+
+                                // NOTE: an empty slice means EOF to the
+                                // decoder, so nothing pre-read is None.
+                                let remaining = &out.remaining;
+                                let arg = (!remaining.is_empty()).then_some(remaining.as_slice());
+
+                                match chunks.resume(arg) {
                                     HttpCoroutineState::Complete(Ok(chunk_out)) => {
                                         response.body = chunk_out.body;
                                         return self.finish(response, chunk_out.remaining);
@@ -241,10 +268,20 @@ impl HttpCoroutine for Http11Send {
 
                         if let Some(len_str) = response.header(HTTP_CONTENT_LENGTH) {
                             let len_str = len_str.trim();
-                            let Ok(len) = len_str.parse::<usize>() else {
+                            let is_digits = len_str.bytes().all(|b| b.is_ascii_digit());
+
+                            let Some(len) =
+                                is_digits.then(|| len_str.parse::<usize>().ok()).flatten()
+                            else {
                                 let err = Http11SendError::InvalidContentLength(len_str.to_owned());
                                 return HttpCoroutineState::Complete(Err(err));
                             };
+
+                            if len > self.max_body_len {
+                                let err = Http11SendError::BodyTooLarge(self.max_body_len);
+                                return HttpCoroutineState::Complete(Err(err));
+                            }
+
                             self.buf = out.remaining;
                             self.response = Some(response);
                             debug!("reading body of length {len}");
@@ -265,8 +302,12 @@ impl HttpCoroutine for Http11Send {
                     return self.finish(response, chunk_out.remaining);
                 }
                 State::BodyLength(len) => {
-                    if let Some(data) = arg.take() {
-                        self.buf.extend_from_slice(data);
+                    match arg.take() {
+                        Some(&[]) if *len > self.buf.len() => {
+                            return HttpCoroutineState::Complete(Err(Http11SendError::Eof));
+                        }
+                        Some(data) => self.buf.extend_from_slice(data),
+                        None => {}
                     }
 
                     if *len > self.buf.len() {
@@ -281,11 +322,19 @@ impl HttpCoroutine for Http11Send {
                     return self.finish(response, remaining);
                 }
                 State::BodyEof => match arg.take() {
+                    _ if self.buf.len() > self.max_body_len => {
+                        let err = Http11SendError::BodyTooLarge(self.max_body_len);
+                        return HttpCoroutineState::Complete(Err(err));
+                    }
                     Some(&[]) => {
                         let buf = mem::take(&mut self.buf);
                         let mut response = self.response.take().expect("response missing");
                         response.body = buf;
                         return self.finish(response, Vec::new());
+                    }
+                    Some(data) if data.len() > self.max_body_len.saturating_sub(self.buf.len()) => {
+                        let err = Http11SendError::BodyTooLarge(self.max_body_len);
+                        return HttpCoroutineState::Complete(Err(err));
                     }
                     Some(data) => {
                         self.buf.extend_from_slice(data);

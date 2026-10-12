@@ -12,6 +12,14 @@ use url::Url;
 
 use crate::{coroutine::HttpYield, rfc9110::response::HttpResponse};
 
+/// Default maximum size in bytes of a buffered response body: 256 MiB.
+///
+/// Generous enough for large attachments and exports, small enough
+/// that a hostile or broken server cannot exhaust memory. Callers
+/// expecting bigger bodies raise the `max_body_len` field of the
+/// coroutine they drive.
+pub const HTTP_DEFAULT_MAX_BODY_LEN: usize = 256 * 1024 * 1024;
+
 /// Terminal output of a successful HTTP request-response exchange.
 #[derive(Clone, Debug)]
 pub struct HttpSendOutput {
