@@ -452,7 +452,6 @@ dependencies = [
  "env_logger",
  "httparse",
  "log",
- "memchr",
  "pimalaya-stream",
  "rustls",
  "rustls-platform-verifier",

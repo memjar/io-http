@@ -12,12 +12,12 @@ use alloc::{
 };
 
 use log::{debug, trace};
-use memchr::{memchr, memmem};
 use thiserror::Error;
 
 use crate::{
     coroutine::*,
     rfc9110::{chars::CRLF, send::HTTP_DEFAULT_MAX_BODY_LEN},
+    scan::{crlf_position, position},
 };
 
 /// Maximum size in bytes of a chunk size line, extensions included
@@ -70,6 +70,8 @@ pub struct Http11ChunksRead {
     wants_read: bool,
     last_chunk: bool,
     buf: Vec<u8>,
+    /// Where the bytes not consumed yet start in `buf`.
+    start: usize,
     body: Vec<u8>,
 }
 
@@ -81,6 +83,7 @@ impl Default for Http11ChunksRead {
             wants_read: false,
             last_chunk: false,
             buf: Vec::new(),
+            start: 0,
             body: Vec::new(),
         }
     }
@@ -93,7 +96,11 @@ impl HttpCoroutine for Http11ChunksRead {
     fn resume(&mut self, arg: Option<&[u8]>) -> HttpCoroutineState<Self::Yield, Self::Return> {
         match arg {
             Some(&[]) => return HttpCoroutineState::Complete(Err(Http11ChunksReadError::Eof)),
-            Some(data) => self.buf.extend_from_slice(data),
+            Some(data) => {
+                self.buf.drain(..self.start);
+                self.start = 0;
+                self.buf.extend_from_slice(data);
+            }
             None => {}
         }
 
@@ -104,6 +111,9 @@ impl HttpCoroutine for Http11ChunksRead {
             }
 
             if self.last_chunk {
+                self.buf.drain(..self.start);
+                self.start = 0;
+
                 let body = mem::take(&mut self.body);
                 let remaining = mem::take(&mut self.buf);
                 return HttpCoroutineState::Complete(Ok(Http11ChunksReadOutput {
@@ -112,11 +122,13 @@ impl HttpCoroutine for Http11ChunksRead {
                 }));
             }
 
+            let rest = &self.buf[self.start..];
+
             match self.state {
                 State::ChunkSize => {
-                    let line_window = self.buf.len().min(HTTP11_MAX_CHUNK_LINE_LEN + CRLF.len());
+                    let line_window = rest.len().min(HTTP11_MAX_CHUNK_LINE_LEN + CRLF.len());
 
-                    let Some(crlf) = memmem::find(&self.buf[..line_window], &CRLF) else {
+                    let Some(crlf) = crlf_position(&rest[..line_window]) else {
                         if line_window == HTTP11_MAX_CHUNK_LINE_LEN + CRLF.len() {
                             let err =
                                 Http11ChunksReadError::ChunkLineTooLarge(HTTP11_MAX_CHUNK_LINE_LEN);
@@ -127,16 +139,16 @@ impl HttpCoroutine for Http11ChunksRead {
                         continue;
                     };
 
-                    let ext = match memchr(b';', &self.buf[..crlf]) {
+                    let ext = match position(&rest[..crlf], |b| b == b';') {
                         None => crlf,
                         Some(ext) => {
-                            let exts = String::from_utf8_lossy(self.buf[ext..crlf].trim_ascii());
+                            let exts = String::from_utf8_lossy(rest[ext..crlf].trim_ascii());
                             trace!("ignore extension(s) `{exts}`");
                             ext
                         }
                     };
 
-                    let chunk_size = String::from_utf8_lossy(self.buf[..ext].trim_ascii());
+                    let chunk_size = String::from_utf8_lossy(rest[..ext].trim_ascii());
 
                     let is_hex = chunk_size.bytes().all(|b| b.is_ascii_hexdigit());
 
@@ -157,18 +169,18 @@ impl HttpCoroutine for Http11ChunksRead {
                         return HttpCoroutineState::Complete(Err(err));
                     }
 
-                    self.buf.drain(..crlf + CRLF.len());
+                    self.start += crlf + CRLF.len();
                     debug!("reading chunk of {n} bytes");
                     self.state = State::ChunkData(n);
                 }
-                State::ChunkData(size) if self.buf.len() < size + CRLF.len() => {
-                    trace!("received incomplete chunk data {}/{size}", self.buf.len());
+                State::ChunkData(size) if rest.len() < size + CRLF.len() => {
+                    trace!("received incomplete chunk data {}/{size}", rest.len());
                     self.wants_read = true;
                     continue;
                 }
                 State::ChunkData(size) => {
-                    self.body.extend(self.buf.drain(..size));
-                    self.buf.drain(..CRLF.len());
+                    self.body.extend_from_slice(&rest[..size]);
+                    self.start += size + CRLF.len();
                     self.state = State::ChunkSize;
                     self.last_chunk = size == 0;
                 }

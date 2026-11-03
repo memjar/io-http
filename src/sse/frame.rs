@@ -12,9 +12,15 @@ use alloc::{
 };
 
 use log::trace;
-use memchr::memchr;
 
-use crate::coroutine::*;
+use crate::{
+    coroutine::*,
+    rfc9110::chars::{CR, LF},
+    scan::position,
+};
+
+/// The UTF-8 byte order mark, ignored once at the stream start.
+const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
 /// One dispatched Server-Sent Event. `event` is `None` when the
 /// `event:` field was absent; `data` has the trailing newline stripped.
@@ -44,7 +50,12 @@ pub enum SseFrameParserYield {
 #[derive(Debug, Default)]
 pub struct SseFrameParser {
     buf: Vec<u8>,
-    bom_stripped: bool,
+    /// Where the bytes not consumed yet start in `buf`.
+    start: usize,
+    /// How many bytes past `start` hold no line end.
+    scanned: usize,
+    /// Whether the stream start was checked for a byte order mark.
+    bom_checked: bool,
     event: Option<String>,
     data: String,
     last_event_id: Option<String>,
@@ -57,6 +68,35 @@ impl SseFrameParser {
     pub fn last_event_id(&self) -> Option<&str> {
         self.last_event_id.as_deref()
     }
+
+    /// Returns (line_end_excl_terminator, total_consumed) past `start`, or
+    /// None when the buffer doesn't yet contain a complete line. Terminator
+    /// may be \r\n, \n, or bare \r; a trailing \r is treated as incomplete
+    /// pending \n.
+    fn next_line(&mut self) -> Option<(usize, usize)> {
+        let rest = &self.buf[self.start..];
+        let from = self.scanned;
+
+        let Some(eol) = position(&rest[from..], |b| (b == CR) | (b == LF)) else {
+            self.scanned = rest.len();
+            return None;
+        };
+
+        let eol = from + eol;
+
+        let consumed = match (rest[eol], rest.get(eol + 1)) {
+            (LF, _) => eol + 1,
+            (_, None) => {
+                self.scanned = eol;
+                return None;
+            }
+            (_, Some(&LF)) => eol + 2,
+            (_, Some(_)) => eol + 1,
+        };
+
+        self.scanned = 0;
+        Some((eol, consumed))
+    }
 }
 
 impl HttpCoroutine for SseFrameParser {
@@ -65,25 +105,37 @@ impl HttpCoroutine for SseFrameParser {
 
     fn resume(&mut self, arg: Option<&[u8]>) -> HttpCoroutineState<Self::Yield, Self::Return> {
         if let Some(data) = arg {
+            if self.start > 0 {
+                self.buf.drain(..self.start);
+                self.start = 0;
+            }
+
             self.buf.extend_from_slice(data);
         }
 
-        if !self.bom_stripped && self.buf.len() >= 3 {
-            if self.buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
-                self.buf.drain(..3);
+        if !self.bom_checked {
+            let head = &self.buf[self.start..];
+            let n = head.len().min(BOM.len());
+
+            if head[..n] != BOM[..n] {
+                self.bom_checked = true;
+            } else if n == BOM.len() {
+                self.start += n;
+                self.bom_checked = true;
+            } else {
+                return HttpCoroutineState::Yielded(SseFrameParserYield::WantsBytes);
             }
-            self.bom_stripped = true;
         }
 
         loop {
-            let Some((line, consumed)) = next_line(&self.buf) else {
+            let Some((len, consumed)) = self.next_line() else {
                 return HttpCoroutineState::Yielded(SseFrameParserYield::WantsBytes);
             };
 
-            let line_bytes = self.buf[..line].to_vec();
-            self.buf.drain(..consumed);
+            let line = &self.buf[self.start..self.start + len];
+            self.start += consumed;
 
-            if line_bytes.is_empty() {
+            if line.is_empty() {
                 if self.data.is_empty() && self.event.is_none() {
                     continue;
                 }
@@ -101,11 +153,11 @@ impl HttpCoroutine for SseFrameParser {
                 return HttpCoroutineState::Yielded(SseFrameParserYield::Frame(frame));
             }
 
-            if line_bytes.first() == Some(&b':') {
+            if line[0] == b':' {
                 continue;
             }
 
-            let (name, value) = split_field(&line_bytes);
+            let (name, value) = split_field(line);
             let Ok(name) = str::from_utf8(name) else {
                 trace!("ignore field with non-utf8 name");
                 continue;
@@ -137,38 +189,10 @@ impl HttpCoroutine for SseFrameParser {
     }
 }
 
-/// Returns (line_end_excl_terminator, total_consumed) or None when the
-/// buffer doesn't yet contain a complete line. Terminator may be \r\n,
-/// \n, or bare \r; a trailing \r is treated as incomplete pending \n.
-fn next_line(buf: &[u8]) -> Option<(usize, usize)> {
-    let cr = memchr(b'\r', buf);
-    let lf = memchr(b'\n', buf);
-
-    match (cr, lf) {
-        (Some(cr), Some(lf)) if cr + 1 == lf => Some((cr, lf + 1)),
-        (Some(cr), Some(lf)) if cr < lf => {
-            if cr + 1 == buf.len() {
-                None
-            } else {
-                Some((cr, cr + 1))
-            }
-        }
-        (Some(cr), None) => {
-            if cr + 1 == buf.len() {
-                None
-            } else {
-                Some((cr, cr + 1))
-            }
-        }
-        (_, Some(lf)) => Some((lf, lf + 1)),
-        (None, None) => None,
-    }
-}
-
 /// Splits a non-empty SSE line on the first `:`; a single leading SP
 /// in the value is stripped per spec.
 fn split_field(line: &[u8]) -> (&[u8], &[u8]) {
-    match memchr(b':', line) {
+    match position(line, |b| b == b':') {
         None => (line, &[]),
         Some(colon) => {
             let name = &line[..colon];
@@ -188,17 +212,24 @@ mod tests {
     use crate::sse::frame::*;
 
     fn collect(stream: &[u8]) -> Vec<SseFrame> {
+        collect_slices(&[stream])
+    }
+
+    fn collect_slices(slices: &[&[u8]]) -> Vec<SseFrame> {
         let mut parser = SseFrameParser::default();
-        let mut arg: Option<&[u8]> = Some(stream);
         let mut frames = Vec::new();
 
-        loop {
-            match parser.resume(arg.take()) {
-                HttpCoroutineState::Yielded(SseFrameParserYield::Frame(frame)) => {
-                    frames.push(frame)
+        for slice in slices {
+            let mut arg = Some(*slice);
+
+            loop {
+                match parser.resume(arg.take()) {
+                    HttpCoroutineState::Yielded(SseFrameParserYield::Frame(frame)) => {
+                        frames.push(frame)
+                    }
+                    HttpCoroutineState::Yielded(SseFrameParserYield::WantsBytes) => break,
+                    HttpCoroutineState::Complete(never) => match never {},
                 }
-                HttpCoroutineState::Yielded(SseFrameParserYield::WantsBytes) => break,
-                HttpCoroutineState::Complete(never) => match never {},
             }
         }
 
@@ -314,6 +345,18 @@ mod tests {
     }
 
     #[test]
+    fn bom_split_across_resumes_stripped() {
+        let frames = collect_slices(&[b"\xEF\xBB", b"\xBFdata: hello\n\n"]);
+        assert_eq!(frames[0].data, "hello");
+    }
+
+    #[test]
+    fn bom_after_first_line_kept() {
+        let frames = collect_slices(&[b"\n", b"\xEF\xBB\xBFdata: hello\n\n"]);
+        assert!(frames.is_empty());
+    }
+
+    #[test]
     fn field_value_leading_space_stripped() {
         let frames = collect(b"data:  hello\n\n");
         assert_eq!(frames[0].data, " hello");
@@ -349,6 +392,16 @@ mod tests {
         }
 
         assert_eq!(frames[0].data, "hello");
+    }
+
+    #[test]
+    fn byte_by_byte_matches_whole() {
+        let stream = b"event: a\r\ndata: x\r\rdata: y\n: c\r\n\r\nid: 2\rdata: z\r\n\n";
+        let bytes: Vec<&[u8]> = stream.chunks(1).collect();
+        let frames = collect_slices(&bytes);
+
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames, collect(stream));
     }
 
     #[test]
