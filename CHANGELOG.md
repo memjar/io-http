@@ -7,29 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-03
+
 ### Added
 
-- Added response size limits, as pub fields: `max_headers_len` and `max_body_len` on `Http11Send` and `Http10Send`, `max_len` on `Http11HeadersRead`, `max_body_len` on `Http11ChunksRead` and `max_chunk_len` on `Http11ChunksReadStream`. Heads default to `HTTP_DEFAULT_MAX_HEADERS_LEN` (64 KiB), bodies and chunks to `HTTP_DEFAULT_MAX_BODY_LEN` (256 MiB), and chunk size lines are capped at `HTTP11_MAX_CHUNK_LINE_LEN` (4 KiB).
+- Added `max_headers_len` and `max_body_len` to `rfc1945::send::Http10Send` and `rfc9112::send::Http11Send`.
 
-- Added a `response` cargo-fuzz target under fuzz/, run from the new `fuzz` devShell.
+  They default to `rfc9112::read_headers::HTTP_DEFAULT_MAX_HEADERS_LEN` (64 KiB) and `rfc9110::send::HTTP_DEFAULT_MAX_BODY_LEN` (256 MiB).
+
+- Added `max_len` to `rfc9112::read_headers::Http11HeadersRead`, 64 KiB by default.
+- Added `max_body_len` to `rfc9112::chunk::Http11ChunksRead`, 256 MiB by default.
+- Added `max_chunk_len` to `rfc9112::chunk_stream::Http11ChunksReadStream`, 256 MiB by default.
+- Added a `response` fuzz target, run from the `fuzz` devShell.
 
 ### Changed
 
-- Added `TooLarge`, `HeadersTooLarge`, `BodyTooLarge`, `ChunkLineTooLarge`, `ChunkTooLarge` and `Eof` variants to the read and send error enums. **Breaking.**
+- **BREAKING**: Changed `rfc1945::send::Http10SendError` and `rfc9112::send::Http11SendError` to fail with `HeadersTooLarge` and `BodyTooLarge`.
+- **BREAKING**: Changed `rfc9112::read_headers::Http11HeadersReadError` to fail with `TooLarge`.
+- **BREAKING**: Changed `rfc9112::chunk::Http11ChunksReadError` to fail with `Eof`, `ChunkLineTooLarge` and `BodyTooLarge`.
+- **BREAKING**: Changed `rfc9112::chunk_stream::Http11ChunksReadStreamError` to fail with `Eof`, `ChunkLineTooLarge` and `ChunkTooLarge`.
+- **BREAKING**: Changed the base64 dependency to [base64-codec](https://crates.io/crates/base64-codec).
 
-- Replaced the base64 crate with [base64-codec](https://crates.io/crates/base64-codec) for HTTP Basic credentials. `HttpAuthBasicError::InvalidBase64` carries no base64 crate error any more, so that crate's releases no longer reach io-http's API. **Breaking.**
+  `rfc7617::basic::HttpAuthBasicError::InvalidBase64` carries no error any more. `HttpAuthBasic::from_authorization` now accepts missing padding, non-zero trailing bits and blanks, and still refuses any other byte outside the alphabet.
 
-  `HttpAuthBasic::from_authorization` decodes the payload leniently: missing padding, non-zero trailing bits and blanks are accepted, any other byte outside the alphabet or data after the padding refused. The codec runs the SIMD backend of the `simd_cpu::SimdCpu` token the application installs, the build target's baseline otherwise.
-
-- Raised the minimum Rust version to 1.89, base64-codec's.
+- Changed the minimum Rust version to 1.89.
 
 ### Fixed
 
-- Fixed a panic on a chunk size near `usize::MAX`, such as `FFFFFFFFFFFFFFFF`, which overflowed the size arithmetic: a hostile server could crash the client.
+- Fixed a chunk size near `usize::MAX` panicking the chunk readers.
 
-- Fixed unbounded buffering of the response head, of `Content-Length`, chunked and read-to-EOF bodies, and of chunk size lines: a server exceeding a limit now fails the exchange with a typed error.
+  A hostile server could crash the client with `FFFFFFFFFFFFFFFF`. It now fails the exchange.
 
-- Fixed the send and chunk coroutines spinning on `WantsRead` forever when the connection closed before a `Content-Length` or chunked body was complete. They now fail with `Eof`.
+- Fixed response heads, bodies and chunk size lines being buffered without bound.
+
+  A server exceeding a limit now fails the exchange with one of the `*TooLarge` errors.
+
+- Fixed the send and chunk coroutines waiting forever on a connection closed mid-body.
+
+  They now fail with `Eof`.
 
 - Fixed `Content-Length` and chunk sizes accepting a leading `+`.
 
@@ -215,7 +230,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Init HTTP 1.1 module with send coroutine
 
-[unreleased]: https://github.com/pimalaya/io-http/compare/v0.5.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-http/compare/v0.6.0..HEAD
+[0.6.0]: https://github.com/pimalaya/io-http/compare/v0.5.0..v0.6.0
 [0.5.0]: https://github.com/pimalaya/io-http/compare/v0.4.0..v0.5.0
 [0.4.0]: https://github.com/pimalaya/io-http/compare/v0.3.0..v0.4.0
 [0.3.0]: https://github.com/pimalaya/io-http/compare/v0.2.0..v0.3.0
