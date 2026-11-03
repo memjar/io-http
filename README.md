@@ -22,16 +22,12 @@ This library is composed of 3 feature-gated layers:
 
 ## Features
 
-- **I/O-free coroutines**: no_std state machines with no sockets and no async runtime, resumable from any blocking, async or in-memory test harness.
-- **HTTP/1.0 and HTTP/1.1**: send a request and receive its response, with fixed-length, chunked and read-to-EOF body strategies; redirects are surfaced to the caller, never followed silently.
-- **Streaming**: decode a long-lived chunked response one chunk at a time and consume server-sent events as they arrive.
-- **Authentication helpers**: build and parse basic and bearer authorization values, with credentials redacted from debug output and logs.
-- **Well-known discovery**: probe the reserved well-known location of a service and surface where it redirects.
-- **Light client**: a standard, blocking client wrapping a stream you opened yourself.
-- **Full client** with **TLS** support:
-  - [Rustls](https://crates.io/crates/rustls) with ring crypto (requires `rustls-ring` feature, enabled by default)
-  - [Rustls](https://crates.io/crates/rustls) with aws crypto (requires `rustls-aws` feature)
-  - [Native TLS](https://crates.io/crates/native-tls) (requires `native-tls` feature)
+- **I/O-free coroutines**: no_std state machines, usable from any blocking or async runtime.
+- **HTTP/1.0 and HTTP/1.1**: requests and responses with fixed-length, chunked and read-to-EOF bodies.
+- **Bounded responses**: heads, bodies and chunks capped by configurable limits.
+- **Streaming**: chunked responses and server-sent events consumed as they arrive.
+- **Authentication**: basic and bearer authorization values, credentials redacted from logs.
+- **Full client**: blocking client with TLS via Rustls (`rustls-ring` default, `rustls-aws`) or Native TLS (`native-tls`).
 
 > [!TIP]
 > I/O HTTP is written in [Rust](https://www.rust-lang.org/) and uses [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to gate backend support. The default feature set is declared in [Cargo.toml](./Cargo.toml) or on [docs.rs](https://docs.rs/crate/io-http/latest/features).
