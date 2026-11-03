@@ -138,7 +138,7 @@ impl HttpCoroutine for Http11HeadersRead {
 
 #[cfg(test)]
 mod tests {
-    use crate::{coroutine::*, rfc9112::read_headers::*};
+    use crate::rfc9112::read_headers::*;
 
     #[test]
     fn parses_complete_head() {
@@ -192,8 +192,10 @@ mod tests {
 
     #[test]
     fn partial_head_over_limit_errors() {
-        let mut coroutine = Http11HeadersRead::default();
-        coroutine.max_len = 32;
+        let mut coroutine = Http11HeadersRead {
+            max_len: 32,
+            ..Http11HeadersRead::default()
+        };
         expect_wants_read(&mut coroutine, Some(b"HTTP/1.1 200 OK\r\n"));
         let err = expect_complete_err(&mut coroutine, Some(b"X-Filler: aaaaaaaaaaaaaaaa\r\n"));
         assert!(matches!(err, Http11HeadersReadError::TooLarge(32)));
@@ -201,8 +203,10 @@ mod tests {
 
     #[test]
     fn complete_head_over_limit_errors() {
-        let mut coroutine = Http11HeadersRead::default();
-        coroutine.max_len = 16;
+        let mut coroutine = Http11HeadersRead {
+            max_len: 16,
+            ..Http11HeadersRead::default()
+        };
         let err = expect_complete_err(&mut coroutine, Some(b"HTTP/1.1 200 OK\r\n\r\n"));
         assert!(matches!(err, Http11HeadersReadError::TooLarge(16)));
     }

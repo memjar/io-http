@@ -106,7 +106,7 @@ impl HttpCoroutine for Http11WellKnown {
 mod tests {
     use alloc::vec::Vec;
 
-    use crate::{coroutine::*, rfc8615::well_known::*};
+    use crate::rfc8615::well_known::*;
 
     #[test]
     fn prepare_request_sets_well_known_path() {

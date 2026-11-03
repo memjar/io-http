@@ -150,22 +150,21 @@ impl Http10Send {
     ) -> HttpCoroutineState<HttpSendYield, Result<HttpSendOutput, Http10SendError>> {
         let keep_alive = self.keep_alive;
 
-        if response.status.is_redirection() {
-            if let Some(location) = response.header(HTTP_LOCATION) {
-                if let Ok(url) = self.request_url.join(location) {
-                    let same_scheme = self.request_url.scheme() == url.scheme();
-                    let same_host = self.request_url.host() == url.host()
-                        && self.request_url.port() == url.port();
-                    let same_origin = same_scheme && same_host;
+        if response.status.is_redirection()
+            && let Some(location) = response.header(HTTP_LOCATION)
+            && let Ok(url) = self.request_url.join(location)
+        {
+            let same_scheme = self.request_url.scheme() == url.scheme();
+            let same_host =
+                self.request_url.host() == url.host() && self.request_url.port() == url.port();
+            let same_origin = same_scheme && same_host;
 
-                    return HttpCoroutineState::Yielded(HttpSendYield::WantsRedirect {
-                        url,
-                        response,
-                        keep_alive,
-                        same_origin,
-                    });
-                }
-            }
+            return HttpCoroutineState::Yielded(HttpSendYield::WantsRedirect {
+                url,
+                response,
+                keep_alive,
+                same_origin,
+            });
         }
 
         HttpCoroutineState::Complete(Ok(HttpSendOutput {
@@ -296,7 +295,7 @@ enum State {
 
 #[cfg(test)]
 mod tests {
-    use crate::{coroutine::*, rfc1945::send::*};
+    use crate::rfc1945::send::*;
 
     #[test]
     fn body_length_completes() {

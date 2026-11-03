@@ -185,7 +185,7 @@ impl HttpCoroutine for Http11ChunksReadStream {
 mod tests {
     use alloc::vec;
 
-    use crate::{coroutine::*, rfc9112::chunk_stream::*};
+    use crate::rfc9112::chunk_stream::*;
 
     #[test]
     fn single_chunk() {
@@ -223,16 +223,20 @@ mod tests {
 
     #[test]
     fn max_usize_chunk_size_errors() {
-        let mut coroutine = Http11ChunksReadStream::default();
-        coroutine.max_chunk_len = usize::MAX;
+        let mut coroutine = Http11ChunksReadStream {
+            max_chunk_len: usize::MAX,
+            ..Http11ChunksReadStream::default()
+        };
         let err = expect_complete_err(&mut coroutine, Some(b"FFFFFFFFFFFFFFFF\r\n"));
         assert!(matches!(err, Http11ChunksReadStreamError::ChunkTooLarge(_)));
     }
 
     #[test]
     fn chunk_over_limit_errors() {
-        let mut coroutine = Http11ChunksReadStream::default();
-        coroutine.max_chunk_len = 4;
+        let mut coroutine = Http11ChunksReadStream {
+            max_chunk_len: 4,
+            ..Http11ChunksReadStream::default()
+        };
         let err = expect_complete_err(&mut coroutine, Some(b"5\r\nhello\r\n"));
         assert!(matches!(err, Http11ChunksReadStreamError::ChunkTooLarge(4)));
     }

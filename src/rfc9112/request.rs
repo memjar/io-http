@@ -38,18 +38,16 @@ impl HttpRequest {
             .headers
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case(HTTP_HOST));
-        if !has_host {
-            if let Some(host) = self.url.host_str() {
-                bytes.extend(HTTP_HOST.as_bytes());
-                bytes.extend(b": ");
-                bytes.extend(host.as_bytes());
-                // NOTE: `Url` drops the port when it is the scheme
-                // default, which is exactly when Host must omit it too.
-                if let Some(port) = self.url.port() {
-                    bytes.extend(format!(":{port}").as_bytes());
-                }
-                bytes.extend(CRLF);
+        if !has_host && let Some(host) = self.url.host_str() {
+            bytes.extend(HTTP_HOST.as_bytes());
+            bytes.extend(b": ");
+            bytes.extend(host.as_bytes());
+            // NOTE: `Url` drops the port when it is the scheme
+            // default, which is exactly when Host must omit it too.
+            if let Some(port) = self.url.port() {
+                bytes.extend(format!(":{port}").as_bytes());
             }
+            bytes.extend(CRLF);
         }
 
         for (key, val) in &self.headers {

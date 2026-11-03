@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `TooLarge`, `HeadersTooLarge`, `BodyTooLarge`, `ChunkLineTooLarge`, `ChunkTooLarge` and `Eof` variants to the read and send error enums. **Breaking.**
 
+- Replaced the base64 crate with [base64-codec](https://crates.io/crates/base64-codec) for HTTP Basic credentials. `HttpAuthBasicError::InvalidBase64` carries no base64 crate error any more, so that crate's releases no longer reach io-http's API. **Breaking.**
+
+  `HttpAuthBasic::from_authorization` decodes the payload leniently: missing padding, non-zero trailing bits and blanks are accepted, any other byte outside the alphabet or data after the padding refused. The codec runs the SIMD backend of the `simd_cpu::SimdCpu` token the application installs, the build target's baseline otherwise.
+
+- Raised the minimum Rust version to 1.89, base64-codec's.
+
 ### Fixed
 
 - Fixed a panic on a chunk size near `usize::MAX`, such as `FFFFFFFFFFFFFFFF`, which overflowed the size arithmetic: a hostile server could crash the client.

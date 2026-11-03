@@ -169,22 +169,21 @@ impl Http11Send {
     ) -> HttpCoroutineState<HttpSendYield, Result<HttpSendOutput, Http11SendError>> {
         let keep_alive = !self.is_conn_closed;
 
-        if response.status.is_redirection() {
-            if let Some(location) = response.header(HTTP_LOCATION) {
-                if let Ok(url) = self.request_url.join(location) {
-                    let same_scheme = self.request_url.scheme() == url.scheme();
-                    let same_host = self.request_url.host() == url.host()
-                        && self.request_url.port() == url.port();
-                    let same_origin = same_scheme && same_host;
+        if response.status.is_redirection()
+            && let Some(location) = response.header(HTTP_LOCATION)
+            && let Ok(url) = self.request_url.join(location)
+        {
+            let same_scheme = self.request_url.scheme() == url.scheme();
+            let same_host =
+                self.request_url.host() == url.host() && self.request_url.port() == url.port();
+            let same_origin = same_scheme && same_host;
 
-                    return HttpCoroutineState::Yielded(HttpSendYield::WantsRedirect {
-                        url,
-                        response,
-                        keep_alive,
-                        same_origin,
-                    });
-                }
-            }
+            return HttpCoroutineState::Yielded(HttpSendYield::WantsRedirect {
+                url,
+                response,
+                keep_alive,
+                same_origin,
+            });
         }
 
         HttpCoroutineState::Complete(Ok(HttpSendOutput {
@@ -351,7 +350,7 @@ impl HttpCoroutine for Http11Send {
 
 #[cfg(test)]
 mod tests {
-    use crate::{coroutine::*, rfc9112::send::*};
+    use crate::rfc9112::send::*;
 
     #[test]
     fn body_chunks_completes() {

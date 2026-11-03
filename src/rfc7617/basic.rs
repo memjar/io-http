@@ -23,9 +23,10 @@ use core::{fmt, str::from_utf8};
 use alloc::{
     format,
     string::{String, ToString},
+    vec::Vec,
 };
 
-use base64::{DecodeError, prelude::BASE64_STANDARD, prelude::Engine as _};
+use base64_codec::codec::Base64Codec;
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
@@ -35,9 +36,10 @@ pub enum HttpAuthBasicError {
     /// The value does not start with the basic scheme prefix.
     #[error("Missing `Basic ` prefix in Authorization value")]
     MissingPrefix,
-    /// The credentials payload is not valid base64.
-    #[error("Invalid base64 in Authorization value: {0}")]
-    InvalidBase64(DecodeError),
+    /// The credentials payload holds a byte outside the base64 alphabet, or
+    /// data after its padding.
+    #[error("Invalid base64 in Authorization value")]
+    InvalidBase64,
     /// The decoded credentials are not valid UTF-8.
     #[error("Decoded credentials are not valid UTF-8")]
     InvalidUtf8,
@@ -68,19 +70,27 @@ impl HttpAuthBasic {
     /// Returns the `Basic <base64(user:pass)>` header value.
     pub fn to_authorization(&self) -> String {
         let payload = format!("{}:{}", self.username, self.password.expose_secret());
-        let encoded = BASE64_STANDARD.encode(payload.as_bytes());
+        let mut encoded = Vec::new();
+        Base64Codec::default().encode_vec(payload.as_bytes(), &mut encoded);
+        // NOTE: the base64 alphabet is ASCII, so this never falls back.
+        let encoded = from_utf8(&encoded).unwrap_or_default();
         format!("Basic {encoded}")
     }
 
     /// Parses a `Basic <b64>` header value.
+    ///
+    /// The payload decodes leniently, as base64-codec does: missing padding,
+    /// non-zero trailing bits and blanks are accepted, any other byte outside
+    /// the alphabet refused.
     pub fn from_authorization(value: &str) -> Result<Self, HttpAuthBasicError> {
         let encoded = value
             .strip_prefix("Basic ")
             .ok_or(HttpAuthBasicError::MissingPrefix)?;
 
-        let decoded = BASE64_STANDARD
-            .decode(encoded)
-            .map_err(HttpAuthBasicError::InvalidBase64)?;
+        let mut decoded = Vec::new();
+        if !Base64Codec::default().decode_vec(encoded.as_bytes(), &mut decoded) {
+            return Err(HttpAuthBasicError::InvalidBase64);
+        }
 
         let s = from_utf8(&decoded).map_err(|_| HttpAuthBasicError::InvalidUtf8)?;
         let (username, password) = s.split_once(':').ok_or(HttpAuthBasicError::MissingColon)?;
@@ -170,7 +180,22 @@ mod tests {
     fn from_authorization_invalid_base64() {
         assert!(matches!(
             HttpAuthBasic::from_authorization("Basic !!!not-b64!!!"),
-            Err(HttpAuthBasicError::InvalidBase64(_))
+            Err(HttpAuthBasicError::InvalidBase64)
+        ));
+    }
+
+    /// The payload decodes leniently: a missing padding is accepted, data
+    /// after the padding is not.
+    #[test]
+    fn from_authorization_lenient_padding() {
+        // NOTE: base64("u:p") = "dTpw", base64("u:") = "dTo=".
+        let parsed = HttpAuthBasic::from_authorization("Basic dTo").unwrap();
+        assert_eq!(parsed.username, "u");
+        assert_eq!(parsed.password.expose_secret(), "");
+
+        assert!(matches!(
+            HttpAuthBasic::from_authorization("Basic dTo=dTpw"),
+            Err(HttpAuthBasicError::InvalidBase64)
         ));
     }
 
